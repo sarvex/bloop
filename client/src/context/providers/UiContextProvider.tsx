@@ -25,6 +25,7 @@ export const UIContextProvider = ({ children }: PropsWithChildren) => {
   const { isSelfServe } = useContext(DeviceContext);
   const [isGithubConnected, setGithubConnected] = useState(isSelfServe);
   const [isGithubChecked, setGithubChecked] = useState(false);
+  const [isRightPanelOpen, setRightPanelOpen] = useState(false);
 
   useEffect(() => {
     if (!isSelfServe) {
@@ -50,6 +51,8 @@ export const UIContextProvider = ({ children }: PropsWithChildren) => {
       isGithubConnected,
       setGithubConnected,
       isGithubChecked,
+      isRightPanelOpen,
+      setRightPanelOpen,
     }),
     [
       isSettingsOpen,
@@ -59,6 +62,7 @@ export const UIContextProvider = ({ children }: PropsWithChildren) => {
       isBugReportModalOpen,
       isGithubConnected,
       isGithubChecked,
+      isRightPanelOpen,
     ],
   );
   return (
