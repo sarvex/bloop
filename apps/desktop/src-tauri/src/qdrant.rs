@@ -89,10 +89,8 @@ fn run_command(command: &Path, qdrant_dir: &Path) -> Child {
     }
 
     // nix::sys::resource::setrlimit().unwrap();
-    let mut child = Command::new(command)
-        .current_dir(qdrant_dir);
-
-    child
+    Command::new(command)
+        .current_dir(qdrant_dir)
         .spawn()
         .expect("failed to start qdrant")
 }

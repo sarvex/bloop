@@ -1,6 +1,5 @@
 use crate::{env::Feature, snippet, Application};
 
-use axum::middleware;
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Extension, Json};
 use std::sync::Arc;
 use std::{borrow::Cow, net::SocketAddr};
@@ -14,11 +13,13 @@ use utoipa::ToSchema;
 mod aaa;
 pub mod answer;
 mod autocomplete;
+mod config;
 mod file;
 mod github;
 mod hoverable;
 mod index;
 mod intelligence;
+pub mod middleware;
 mod query;
 mod repos;
 mod semantic;
@@ -27,7 +28,7 @@ pub type Router<S = Application> = axum::Router<S>;
 
 #[allow(unused)]
 pub(in crate::webserver) mod prelude {
-    pub(in crate::webserver) use super::{json, EndpointError, Error, ErrorKind, Result};
+    pub(in crate::webserver) use super::{json, EndpointError, Error, ErrorKind, Result, Router};
     pub(in crate::webserver) use crate::indexes::Indexes;
     pub(in crate::webserver) use axum::{
         extract::Query, http::StatusCode, response::IntoResponse, Extension,
@@ -41,6 +42,7 @@ pub async fn start(app: Application) -> anyhow::Result<()> {
     let bind = SocketAddr::new(app.config.host.parse()?, app.config.port);
 
     let mut api = Router::new()
+        .route("/config", get(config::handle))
         // querying
         .route("/q", get(query::handle))
         // autocomplete
@@ -70,6 +72,10 @@ pub async fn start(app: Application) -> anyhow::Result<()> {
             get(answer::handle).with_state(Arc::new(answer::AnswerState::default())),
         );
 
+    if app.env.allow(Feature::AnyPathScan) {
+        api = api.route("/repos/scan", get(repos::scan_local));
+    }
+
     if app.env.allow(Feature::GithubDeviceFlow) {
         api = api
             .route("/remotes/github/login", get(github::login))
@@ -77,13 +83,12 @@ pub async fn start(app: Application) -> anyhow::Result<()> {
             .route("/remotes/github/status", get(github::status));
     }
 
-    if app.env.allow(Feature::AnyPathScan) {
-        api = api.route("/repos/scan", get(repos::scan_local));
-    }
-
     // Note: all routes above this point must be authenticated.
+    // These middlewares MUST provide the `middleware::User` extension.
     if app.env.allow(Feature::AuthorizationRequired) {
         api = aaa::router(api, app.clone());
+    } else {
+        api = middleware::local_user(api, app.clone());
     }
 
     api = api
@@ -91,7 +96,7 @@ pub async fn start(app: Application) -> anyhow::Result<()> {
         .route("/api-doc/openapi.yaml", get(openapi_yaml::handle))
         .route("/health", get(health));
 
-    let api: Router<()> = api
+    let api = api
         .layer(Extension(app.indexes.clone()))
         .layer(Extension(app.semantic.clone()))
         .layer(Extension(app.clone()))

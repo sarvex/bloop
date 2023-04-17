@@ -7,10 +7,11 @@ async fn main() -> Result<()> {
     let app = Application::initialize(
         Environment::server(),
         Configuration::cli_overriding_config_file()?,
+        None,
+        None,
     )
     .await?;
 
     app.initialize_sentry();
-    app.initialize_analytics();
     app.run().await
 }

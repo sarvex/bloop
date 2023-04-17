@@ -10,12 +10,13 @@ use ort::{
 use qdrant_client::{
     prelude::{QdrantClient, QdrantClientConfig},
     qdrant::{
-        r#match::MatchValue, vectors_config, with_payload_selector::SelectorOptions,
+        r#match::MatchValue, vectors_config, with_payload_selector, with_vectors_selector,
         CollectionOperationResponse, CreateCollection, Distance, FieldCondition, Filter, Match,
         PointId, PointStruct, ScoredPoint, SearchPoints, VectorParams, VectorsConfig,
-        WithPayloadSelector,
+        WithPayloadSelector, WithVectorsSelector,
     },
 };
+
 use rayon::prelude::*;
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
@@ -186,18 +187,33 @@ impl Semantic {
             anyhow::bail!("no search target for query");
         };
 
-        let repo_filter = parsed_query
-            .repo()
-            .map(|r| make_kv_filter("repo_name", r).into());
+        let repo_filter: qdrant_client::qdrant::Condition = {
+            let conditions = parsed_query
+                .repos()
+                .map(|r| make_kv_filter("repo_name", r).into())
+                .collect();
+            // one of the above repos should match
+            Filter {
+                should: conditions,
+                ..Default::default()
+            }
+        }
+        .into();
 
-        let lang_filter = parsed_query
-            .lang()
-            .map(|l| make_kv_filter("lang", l).into());
+        let lang_filter: qdrant_client::qdrant::Condition = {
+            let conditions = parsed_query
+                .langs()
+                .map(|l| make_kv_filter("lang", l).into())
+                .collect();
+            // one of the above langs should match
+            Filter {
+                should: conditions,
+                ..Default::default()
+            }
+        }
+        .into();
 
-        let filters = [repo_filter, lang_filter]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let filters = vec![repo_filter, lang_filter];
 
         let response = self
             .qdrant
@@ -206,11 +222,14 @@ impl Semantic {
                 limit,
                 vector: self.embed(query)?,
                 with_payload: Some(WithPayloadSelector {
-                    selector_options: Some(SelectorOptions::Enable(true)),
+                    selector_options: Some(with_payload_selector::SelectorOptions::Enable(true)),
                 }),
                 filter: Some(Filter {
                     must: filters,
                     ..Default::default()
+                }),
+                with_vectors: Some(WithVectorsSelector {
+                    selector_options: Some(with_vectors_selector::SelectorOptions::Enable(true)),
                 }),
                 ..Default::default()
             })
@@ -331,8 +350,71 @@ fn make_kv_filter(key: &str, value: &str) -> FieldCondition {
     FieldCondition {
         key,
         r#match: Some(Match {
-            match_value: MatchValue::Text(value).into(),
+            match_value: MatchValue::Keyword(value).into(),
         }),
         ..Default::default()
     }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(ai, bi)| ai * bi).sum()
+}
+
+fn norm(a: &[f32]) -> f32 {
+    dot(a, a)
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    dot(a, b) / (norm(a) * norm(b))
+}
+
+// returns a list of indices to preserve from `snippets`
+//
+// query_embedding: the embedding of the query terms
+// embeddings: the list of embeddings to select from
+// lambda: MMR is a weighted selection of two opposing factors:
+//    - relevance to the query
+//    - "novelty" or, the measure of how minimal the similarity is
+//      to existing documents in the selection
+//      The value of lambda skews the weightage in favor of either relevance or novelty.
+//  k: the number of embeddings to select
+pub fn deduplicate_with_mmr(
+    query_embedding: &[f32],
+    embeddings: &[&[f32]],
+    lambda: f32,
+    k: usize,
+) -> Vec<usize> {
+    let mut idxs = vec![];
+
+    if embeddings.len() < k {
+        return (0..embeddings.len()).collect();
+    }
+
+    while idxs.len() < k {
+        let mut best_score = f32::NEG_INFINITY;
+        let mut idx_to_add = None;
+
+        for (i, emb) in embeddings.iter().enumerate() {
+            if idxs.contains(&i) {
+                continue;
+            }
+            let first_part = cosine_similarity(query_embedding, emb);
+            let mut second_part = 0.;
+            for j in idxs.iter() {
+                let cos_sim = cosine_similarity(emb, embeddings[*j]);
+                if cos_sim > second_part {
+                    second_part = cos_sim;
+                }
+            }
+            let equation_score = lambda * first_part - (1. - lambda) * second_part;
+            if equation_score > best_score {
+                best_score = equation_score;
+                idx_to_add = Some(i);
+            }
+        }
+        if let Some(i) = idx_to_add {
+            idxs.push(i);
+        }
+    }
+    idxs
 }

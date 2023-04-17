@@ -15,10 +15,11 @@ import {
   splitPathForBreadcrumbs,
 } from '../../utils';
 import ErrorFallback from '../../components/ErrorFallback';
-import Skeleton from '../Skeleton';
+import Skeleton from '../../components/Skeleton';
 import useAppNavigation from '../../hooks/useAppNavigation';
 import { FileTreeFileType } from '../../types';
 import { getFileName } from '../../utils/file';
+import FileMenu from '../../components/FileMenu';
 
 type Props = {
   data: any;
@@ -148,15 +149,19 @@ const ResultFull = ({ data }: Props) => {
                   path={result.relativePath}
                 />
               </div>
-              <div className="flex gap-2">
-                {/*<SelectToggleButton onlyIcon title="Star">*/}
-                {/*  <Star />*/}
-                {/*</SelectToggleButton>*/}
-                {/*<Button variant="primary" onClick={() => setShareOpen(true)}>*/}
-                {/*  Share*/}
-                {/*  <ArrowBoxOut />*/}
-                {/*</Button>*/}
-              </div>
+              {/*<div className="flex gap-2">*/}
+              {/*<SelectToggleButton onlyIcon title="Star">*/}
+              {/*  <Star />*/}
+              {/*</SelectToggleButton>*/}
+              {/*<Button variant="primary" onClick={() => setShareOpen(true)}>*/}
+              {/*  Share*/}
+              {/*  <ArrowBoxOut />*/}
+              {/*</Button>*/}
+              {/*</div>*/}
+              <FileMenu
+                relativePath={result.relativePath}
+                repoPath={result.repoPath}
+              />
             </div>
             <div className="overflow-scroll flex-1">
               {/*<div*/}

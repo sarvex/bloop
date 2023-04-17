@@ -3,21 +3,20 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::remotes;
+use crate::{remotes, Application};
 
-use super::*;
+use super::{middleware::User, prelude::*};
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::Query,
     headers::{authorization::Bearer, Authorization},
     http::{Request, StatusCode},
-    middleware::Next,
+    middleware::{from_fn_with_state, Next},
     response::Redirect,
+    routing::get,
     TypedHeader,
 };
 use axum_extra::extract::cookie::{Cookie, PrivateCookieJar, SameSite};
-use dashmap::DashMap;
-use futures::future;
 use octocrab::Octocrab;
 use rand::{distributions::Alphanumeric, Rng};
 use secrecy::{ExposeSecret, SecretString};
@@ -39,6 +38,7 @@ struct GithubAuthToken {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AuthCookie {
+    user_id: String,
     github_token: GithubAuthToken,
     created_at: u64,
     member_checked_at: Option<u64>,
@@ -47,8 +47,9 @@ struct AuthCookie {
 impl AuthCookie {
     const COOKIE_NAME: &str = "auth_cookie";
 
-    fn new(github_token: GithubAuthToken) -> Self {
+    fn new(github_token: GithubAuthToken, user_id: String) -> Self {
         Self {
+            user_id,
             github_token,
             created_at: unix_time_sec(),
             member_checked_at: None,
@@ -136,7 +137,10 @@ pub(super) async fn login(
          &redirect_uri={redirect_uri}",
     );
 
-    auth_layer.initialized_login.insert(state, Instant::now());
+    _ = auth_layer
+        .initialized_login
+        .entry(state)
+        .insert_entry(Instant::now());
     serde_json::json!({ "oauth_url": github_oauth_url }).to_string()
 }
 
@@ -157,7 +161,7 @@ pub(super) struct AuthorizedParams {
     ),
 )]
 pub(super) async fn authorized(
-    Extension(app): Extension<Application>,
+    axum::extract::State(app): axum::extract::State<Application>,
     Extension(auth_layer): Extension<Arc<AuthLayer>>,
     Query(params): Query<AuthorizedParams>,
     jar: PrivateCookieJar,
@@ -190,8 +194,13 @@ pub(super) async fn authorized(
         .await
         .unwrap();
 
+    let octocrab = make_octocrab(&gh_token).expect("bad token received from github");
+    let user_name = get_username(&octocrab)
+        .await
+        .expect("can't retrieve user name");
+
     (
-        jar.add(AuthCookie::new(gh_token).to_cookie()),
+        jar.add(AuthCookie::new(gh_token, user_name).to_cookie()),
         Redirect::to("/"),
     )
 }
@@ -205,10 +214,7 @@ fn unix_time_sec() -> u64 {
 
 pub(super) fn router(router: Router, app: Application) -> Router {
     router
-        .layer(middleware::from_fn_with_state(
-            app,
-            authenticate_authorize_reissue,
-        ))
+        .layer(from_fn_with_state(app, authenticate_authorize_reissue))
         .route("/auth/login/complete", get(authorized))
         .route("/auth/login/start", get(login))
         .layer(Extension(Arc::new(AuthLayer::default())))
@@ -219,7 +225,7 @@ pub(crate) struct AuthLayer {
     /// Logins that have been initiated, but not completed.
     ///
     /// Maps to the time this login attempt was created.
-    initialized_login: DashMap<State, Instant>,
+    initialized_login: scc::HashMap<State, Instant>,
 
     /// The HTTP client.
     client: reqwest::Client,
@@ -234,36 +240,49 @@ impl AuthLayer {
 }
 
 async fn authenticate_authorize_reissue<B>(
-    Extension(app): Extension<Application>,
+    axum::extract::State(app): axum::extract::State<Application>,
     Extension(auth_layer): Extension<Arc<AuthLayer>>,
     auth_header: Option<TypedHeader<Authorization<Bearer>>>,
     jar: PrivateCookieJar,
-    request: Request<B>,
+    mut request: Request<B>,
     next: Next<B>,
 ) -> impl IntoResponse {
-    let unauthorized = || StatusCode::UNAUTHORIZED.into_response();
+    // For better logging, we use some heuristics here to determine what the request type is. We
+    // know that user requests authorize through a cookie, and bot requests authorize with the
+    // `Authorization` header.
+    let result = if jar.get(AuthCookie::COOKIE_NAME).is_some() {
+        user_auth(jar, &app, &auth_layer.client)
+            .await
+            .context("failed to authenticate user request")
+    } else if auth_header.is_some() {
+        bot_auth(auth_header, &app)
+            .await
+            .context("failed to authenticate bot request")
+            .map(|()| (User(None), jar))
+    } else {
+        Err(anyhow::anyhow!(
+            "request had no auth cookie or `Authorization` header"
+        ))
+    };
 
-    let user_fut = user_auth(jar, &app, &auth_layer.client);
-    let bearer_fut = bot_auth(auth_header, &app);
-
-    let new_cookies = match future::join(user_fut, bearer_fut).await {
-        (Ok(new_cookies), _) => Some(new_cookies),
-        (_, Ok(_)) => None,
-        (Err(e1), Err(e2)) => {
-            error!(?e1, ?e2, "failed to authenticate request");
-            return unauthorized();
+    let (user, jar) = match result {
+        Ok(new_cookies) => new_cookies,
+        Err(e) => {
+            error!("{}", e);
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     };
 
+    request.extensions_mut().insert(user);
     let body = next.run(request).await;
-    (new_cookies, body).into_response()
+    (jar, body).into_response()
 }
 
 async fn user_auth(
     jar: PrivateCookieJar,
     app: &Application,
     client: &reqwest::Client,
-) -> Result<PrivateCookieJar> {
+) -> Result<(User, PrivateCookieJar)> {
     let mut auth_cookie: AuthCookie = serde_json::from_str(
         jar.get(AuthCookie::COOKIE_NAME)
             .context("missing auth cookie")?
@@ -275,7 +294,7 @@ async fn user_auth(
     let need_refresh = auth_cookie.need_refresh();
 
     if member_checked && !need_refresh {
-        return Ok(jar);
+        return Ok((User(Some(auth_cookie.user_id.clone())), jar));
     }
 
     if need_refresh {
@@ -305,7 +324,7 @@ async fn user_auth(
         auth_cookie.update_token(gh_token);
     }
 
-    if !member_checked {
+    let user_name = if !member_checked {
         let org_name = {
             let cred = app.credentials.github().unwrap();
             match cred.auth {
@@ -315,23 +334,8 @@ async fn user_auth(
         };
 
         // An octocrab instance based on the user's access token.
-        let octocrab = Octocrab::builder()
-            .personal_token(
-                auth_cookie
-                    .github_token
-                    .access_token
-                    .expose_secret()
-                    .clone(),
-            )
-            .build()
-            .context("failed to build octocrab instance")?;
-
-        let user_name: String = octocrab
-            .current()
-            .user()
-            .await
-            .context("failed to get user")?
-            .login;
+        let octocrab = make_octocrab(&auth_cookie.github_token)?;
+        let user_name = get_username(&octocrab).await?;
 
         // https://docs.github.com/en/rest/orgs/members?apiVersion=2022-11-28#check-organization-membership-for-a-user
         let is_member = octocrab
@@ -348,8 +352,12 @@ async fn user_auth(
             bail!("{user_name} is not a member of the {org_name} organization");
         }
 
+        auth_cookie.user_id = user_name.clone();
         auth_cookie.set_member_checked();
-    }
+        user_name
+    } else {
+        auth_cookie.user_id.clone()
+    };
 
     // We set SameSite to Strict to avoid CSRF. Specifically, this is *not* done when the cookie is
     // initially created as part of the OAuth process, as OAuth redirects would not work. The
@@ -359,7 +367,24 @@ async fn user_auth(
     cookie.set_same_site(SameSite::Strict);
     cookie.set_secure(true);
 
-    Ok(jar.add(cookie))
+    Ok((User(Some(user_name)), jar.add(cookie)))
+}
+
+async fn get_username(octocrab: &Octocrab) -> Result<String, anyhow::Error> {
+    Ok(octocrab
+        .current()
+        .user()
+        .await
+        .context("failed to get user")?
+        .login)
+}
+
+fn make_octocrab(github_token: &GithubAuthToken) -> Result<Octocrab, anyhow::Error> {
+    let octocrab = Octocrab::builder()
+        .personal_token(github_token.access_token.expose_secret().clone())
+        .build()
+        .context("failed to build octocrab instance")?;
+    Ok(octocrab)
 }
 
 async fn bot_auth(

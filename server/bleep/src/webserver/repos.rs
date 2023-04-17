@@ -1,7 +1,8 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, hash::Hash, time::Duration};
 
 use crate::{
     repo::{Backend, RepoRef, Repository, SyncStatus},
+    state::RepositoryPool,
     Application,
 };
 use axum::{
@@ -16,7 +17,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::prelude::*;
 
-#[derive(Serialize, ToSchema, Debug)]
+#[derive(Serialize, ToSchema, Debug, Eq)]
 pub(super) struct Repo {
     pub(super) provider: Backend,
     pub(super) name: String,
@@ -41,12 +42,15 @@ impl From<(&RepoRef, &Repository)> for Repo {
                 .unwrap()
                 .and_local_timezone(Utc)
                 .unwrap(),
-            last_index: Some(
-                NaiveDateTime::from_timestamp_opt(repo.last_index_unix_secs as i64, 0)
-                    .unwrap()
-                    .and_local_timezone(Utc)
-                    .unwrap(),
-            ),
+            last_index: match repo.last_index_unix_secs {
+                0 => None,
+                other => Some(
+                    NaiveDateTime::from_timestamp_opt(other as i64, 0)
+                        .unwrap()
+                        .and_local_timezone(Utc)
+                        .unwrap(),
+                ),
+            },
             most_common_lang: repo.most_common_lang.clone(),
         }
     }
@@ -68,6 +72,18 @@ impl Repo {
             last_index: None,
             most_common_lang: None,
         }
+    }
+}
+
+impl Hash for Repo {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.repo_ref.hash(state)
+    }
+}
+
+impl PartialEq for Repo {
+    fn eq(&self, other: &Self) -> bool {
+        self.repo_ref == other.repo_ref
     }
 }
 
@@ -119,16 +135,12 @@ pub(super) async fn index_status(Extension(app): Extension<Application>) -> impl
     ),
 )]
 pub(super) async fn indexed(Extension(app): Extension<Application>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(ReposResponse::List(
-            app.repo_pool
-                .iter()
-                .map(|elem| Repo::from((elem.key(), elem.value())))
-                .collect(),
-        ))
-        .into_response(),
-    )
+    let mut repos = vec![];
+    app.repo_pool
+        .scan_async(|k, v| repos.push(Repo::from((k, v))))
+        .await;
+
+    json(ReposResponse::List(repos))
 }
 
 /// Get details of an indexed repository based on their id
@@ -147,11 +159,14 @@ pub(super) async fn get_by_id(
         return Err(Error::new(ErrorKind::NotFound, "Can't find repository"));
     };
 
-    match app.repo_pool.get(&reporef) {
-        Some(result) => Ok(json(ReposResponse::Item(Repo::from((
-            result.key(),
-            result.value(),
-        ))))),
+    match app
+        .repo_pool
+        .read_async(&reporef, |k, v| {
+            json(ReposResponse::Item(Repo::from((k, v))))
+        })
+        .await
+    {
+        Some(result) => Ok(result),
         None => Err(Error::new(ErrorKind::NotFound, "Can't find repository")),
     }
 }
@@ -173,16 +188,17 @@ pub(super) async fn delete_by_id(
         return Err(Error::new(ErrorKind::NotFound, "Can't find repository"));
     };
 
-    let deleted = match app.repo_pool.get_mut(&reporef) {
-        Some(mut result) => {
-            result.value_mut().mark_removed();
-            app.write_index().queue_sync_and_index(vec![reporef]);
-            Ok(())
-        }
+    match app
+        .repo_pool
+        .update_async(&reporef, |k, value| {
+            value.mark_removed();
+            app.write_index().queue_sync_and_index(vec![k.clone()]);
+        })
+        .await
+    {
+        Some(_) => Ok(json(ReposResponse::Deleted)),
         None => Err(Error::new(ErrorKind::NotFound, "Repo not found")),
-    };
-
-    Ok(deleted.map(|_| json(ReposResponse::Deleted)))
+    }
 }
 
 /// Synchronize a repo by its id
@@ -222,45 +238,36 @@ pub(super) async fn available(Extension(app): Extension<Application>) -> impl In
         .unwrap_or_default()
         .iter()
         .map(|repo| {
-            let local_duplicates = app
-                .repo_pool
-                .iter()
-                .filter(|elem| {
-                    // either `ssh_url` or `clone_url` should match what we generate.
-                    //
-                    // also note that this is quite possibly not the
-                    // most efficient way of doing this, but the
-                    // number of repos should be small, so even n^2
-                    // should be fast.
-                    //
-                    // most of the time is spent in the network.
-                    [
-                        repo.ssh_url.as_deref().unwrap_or_default().to_lowercase(),
-                        repo.clone_url
-                            .as_ref()
-                            .map(|url| url.as_str())
-                            .unwrap_or_default()
-                            .to_lowercase(),
-                    ]
-                    .contains(&elem.remote.to_string().to_lowercase())
-                })
-                .map(|elem| elem.key().clone())
-                .collect();
+            let mut local_duplicates = vec![];
+            app.repo_pool.scan(|k, v| {
+                // either `ssh_url` or `clone_url` should match what we generate.
+                //
+                // also note that this is quite possibly not the
+                // most efficient way of doing this, but the
+                // number of repos should be small, so even n^2
+                // should be fast.
+                //
+                // most of the time is spent in the network.
+                if [
+                    repo.ssh_url.as_deref().unwrap_or_default().to_lowercase(),
+                    repo.clone_url
+                        .as_ref()
+                        .map(|url| url.as_str())
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                ]
+                .contains(&v.remote.to_string().to_lowercase())
+                {
+                    local_duplicates.push(k.clone())
+                }
+            });
 
             Repo::from_github(local_duplicates, repo)
         })
-        .collect::<Vec<_>>();
+        .collect::<HashSet<_>>();
 
-    (
-        StatusCode::OK,
-        Json(ReposResponse::List(
-            app.repo_pool
-                .iter()
-                .map(|elem| Repo::from((elem.key(), elem.value())))
-                .chain(unknown_github)
-                .collect(),
-        )),
-    )
+    let repos = list_unique_repos(app.repo_pool.clone(), unknown_github).await;
+    (StatusCode::OK, Json(ReposResponse::List(repos)))
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Debug)]
@@ -284,12 +291,14 @@ pub(super) async fn set_indexed(
 ) -> impl IntoResponse {
     let mut repo_list = new_list.indexed.into_iter().collect::<HashSet<_>>();
 
-    for mut existing in app.repo_pool.iter_mut() {
-        if !repo_list.contains(existing.key()) {
-            existing.value_mut().mark_removed();
-            repo_list.insert(existing.key().to_owned());
-        }
-    }
+    app.repo_pool
+        .for_each_async(|k, existing| {
+            if !repo_list.contains(k) {
+                existing.mark_removed();
+                repo_list.insert(k.to_owned());
+            }
+        })
+        .await;
 
     app.write_index()
         .queue_sync_and_index(repo_list.into_iter().collect());
@@ -331,5 +340,123 @@ pub(super) async fn scan_local(
         )))
     } else {
         Err(Error::user("scanning not allowed").with_status(StatusCode::UNAUTHORIZED))
+    }
+}
+
+async fn list_unique_repos(repo_pool: RepositoryPool, other: HashSet<Repo>) -> Vec<Repo> {
+    let mut repos = HashSet::new();
+    repo_pool
+        .scan_async(|k, v| {
+            // this will hash to the same thing as another object due
+            // to `Hash` proxying to `repo_ref`, so stay on the safe
+            // side and check like good citizens
+            let repo = Repo::from((k, v));
+            repos.insert(repo);
+        })
+        .await;
+
+    repos.extend(other);
+    repos.into_iter().collect()
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashSet;
+
+    use crate::repo::{GitProtocol, GitRemote, RepoRef, RepoRemote::Git, Repository, SyncStatus};
+
+    use super::{list_unique_repos, Repo, RepositoryPool};
+
+    #[tokio::test]
+    async fn unique_repos_only() {
+        let repo_pool = RepositoryPool::default();
+        repo_pool
+            .insert(
+                RepoRef::try_from("github.com/test/test").unwrap(),
+                Repository {
+                    disk_path: "/repo".into(),
+                    remote: Git(GitRemote {
+                        protocol: GitProtocol::Https,
+                        host: "github.com".into(),
+                        address: "test/test".into(),
+                    }),
+                    sync_status: SyncStatus::Done,
+                    last_commit_unix_secs: 123456,
+                    last_index_unix_secs: 123456,
+                    most_common_lang: None,
+                },
+            )
+            .unwrap();
+        repo_pool
+            .insert(
+                RepoRef::try_from("local//code/test2").unwrap(),
+                Repository {
+                    disk_path: "/repo2".into(),
+                    remote: Git(GitRemote {
+                        protocol: GitProtocol::Https,
+                        host: "github.com".into(),
+                        address: "test/test2".into(),
+                    }),
+                    sync_status: SyncStatus::Done,
+                    last_commit_unix_secs: 123456,
+                    last_index_unix_secs: 123456,
+                    most_common_lang: None,
+                },
+            )
+            .unwrap();
+
+        let mut gh_list = HashSet::new();
+        gh_list.insert(
+            (
+                &RepoRef::try_from("github.com/test/test").unwrap(),
+                &Repository {
+                    disk_path: "/unused".into(),
+                    remote: Git(GitRemote {
+                        protocol: GitProtocol::Https,
+                        host: "github.com".into(),
+                        address: "test/test".into(),
+                    }),
+                    sync_status: SyncStatus::Uninitialized,
+                    last_commit_unix_secs: 123456,
+                    last_index_unix_secs: 0,
+                    most_common_lang: None,
+                },
+            )
+                .into(),
+        );
+
+        let mut ghrepo_2: Repo = (
+            &RepoRef::try_from("github.com/test/test2").unwrap(),
+            &Repository {
+                disk_path: "/unused".into(),
+                remote: Git(GitRemote {
+                    protocol: GitProtocol::Https,
+                    host: "github.com".into(),
+                    address: "test/test2".into(),
+                }),
+                sync_status: SyncStatus::Uninitialized,
+                last_commit_unix_secs: 123456,
+                last_index_unix_secs: 0,
+                most_common_lang: None,
+            },
+        )
+            .into();
+
+        ghrepo_2.local_duplicates = vec![RepoRef::try_from("local//code/test2").unwrap()];
+        gh_list.insert(ghrepo_2);
+
+        let unique = list_unique_repos(repo_pool, gh_list)
+            .await
+            .into_iter()
+            .map(|repo| repo.repo_ref)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            HashSet::from([
+                RepoRef::try_from("local//code/test2").unwrap(),
+                RepoRef::try_from("github.com/test/test").unwrap(),
+                RepoRef::try_from("github.com/test/test2").unwrap(),
+            ]),
+            unique
+        );
     }
 }

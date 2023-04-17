@@ -71,12 +71,12 @@ pub(super) async fn login(Extension(app): Extension<Application>) -> impl IntoRe
         .unwrap()
         .add_header(ACCEPT, "application/json".to_string())
         .build()
-        .unwrap();
+        .map_err(|_| Error::internal("failed to build octocrab client"))?;
 
     let codes = github
         .authenticate_as_device(&client_id, ["public_repo", "repo", "read:org"])
         .await
-        .unwrap();
+        .map_err(|_| Error::internal("failed to authenticate as device"))?;
 
     tokio::spawn(poll_for_oauth_token(
         github,
@@ -106,7 +106,7 @@ pub(super) async fn logout(Extension(app): Extension<Application>) -> impl IntoR
         let saved = app
             .config
             .source
-            .save_credentials(&app.credentials.serialize());
+            .save_credentials(&app.credentials.serialize().await);
 
         if saved.is_ok() {
             return Ok(json(GithubResponse::Status(GithubCredentialStatus::Ok)));
@@ -169,7 +169,7 @@ async fn poll_for_oauth_token(
     let saved = app
         .config
         .source
-        .save_credentials(&app.credentials.serialize());
+        .save_credentials(&app.credentials.serialize().await);
 
     if let Err(err) = saved {
         error!(?err, "Failed to save credentials to disk");

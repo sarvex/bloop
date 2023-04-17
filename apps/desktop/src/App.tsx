@@ -78,7 +78,6 @@ import TextSearch from './TextSearch';
 
 function App() {
   const [homeDirectory, setHomeDir] = useState('');
-  const [deviceId, setDeviceId] = useState('');
   const [indexFolder, setIndexFolder] = useState('');
   const [os, setOs] = useState({
     arch: '',
@@ -91,20 +90,6 @@ function App() {
 
   useEffect(() => {
     homeDir().then(setHomeDir);
-    invoke('get_device_id')
-      .then((res) => {
-        if (res) {
-          setDeviceId(res.toString().trim());
-        } else {
-          let generatedId = getPlainFromStorage(DEVICE_ID);
-          if (!generatedId) {
-            generatedId = generateUniqueId();
-            savePlainToStorage(DEVICE_ID, generatedId);
-          }
-          setDeviceId(generatedId);
-        }
-      })
-      .catch(console.log);
     Promise.all([
       tauriOs.arch(),
       tauriOs.type(),
@@ -120,12 +105,6 @@ function App() {
       //   1000 * 60 * 60,
       // );
     });
-    if (import.meta.env.SENTRY_DSN_BE) {
-      invoke('initialize_sentry', {
-        dsn: import.meta.env.SENTRY_DSN_BE,
-        environment: import.meta.env.MODE,
-      });
-    }
   }, []);
 
   const deviceContextValue = useMemo(
@@ -140,7 +119,6 @@ function App() {
       chooseFolder: openDialog,
       indexFolder,
       setIndexFolder,
-      deviceId,
       listen,
       os,
       invokeTauriCommand: invoke,
@@ -149,9 +127,10 @@ function App() {
       isRepoManagementAllowed: true,
       forceAnalytics: false,
       isSelfServe: false,
+      envConfig: {},
       showNativeMessage: message,
     }),
-    [homeDirectory, indexFolder, deviceId, os, release],
+    [homeDirectory, indexFolder, os, release],
   );
   return (
     <>
