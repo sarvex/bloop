@@ -18,7 +18,7 @@ mod github;
 mod hoverable;
 mod index;
 mod intelligence;
-mod middleware;
+pub mod middleware;
 mod query;
 mod repos;
 mod semantic;

@@ -14,6 +14,8 @@ type ContextType = {
   isGithubConnected: boolean;
   setGithubConnected: (b: boolean) => void;
   isGithubChecked: boolean;
+  shouldShowWelcome: boolean;
+  setShouldShowWelcome: (b: boolean) => void;
   isRightPanelOpen: boolean;
   setRightPanelOpen: React.Dispatch<React.SetStateAction<boolean>>;
 };
@@ -32,6 +34,8 @@ export const UIContext = createContext<ContextType>({
   isGithubConnected: false,
   setGithubConnected: () => {},
   isGithubChecked: false,
+  shouldShowWelcome: false,
+  setShouldShowWelcome: () => {},
   isRightPanelOpen: false,
   setRightPanelOpen: () => {},
 });

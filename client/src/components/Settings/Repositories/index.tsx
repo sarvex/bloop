@@ -11,7 +11,7 @@ import { PlusSignInBubble, Repository } from '../../../icons';
 import { deleteRepo, getRepos, gitHubLogout } from '../../../services/api';
 import { UIContext } from '../../../context/uiContext';
 import RepoList from '../../RepoList';
-import { getCommonFolder, splitPath } from '../../../utils';
+import { groupReposByParentFolder, splitPath } from '../../../utils';
 import { DropdownWithIcon } from '../../Dropdown';
 import GitHubIcon from '../../../icons/GitHubIcon';
 import { DeviceContext } from '../../../context/deviceContext';
@@ -44,30 +44,9 @@ const RepositoriesSettings = () => {
         (r) =>
           r.provider === RepoProvider.Local && r.sync_status == SyncStatus.Done,
       ) || [];
-    const commonFolder =
-      localRepositories.length > 1
-        ? getCommonFolder(localRepositories.map((lr) => lr.ref))
-        : '';
-    return localRepositories
-      .map((r) => {
-        const folderName =
-          localRepositories.length > 1
-            ? r.ref.replace(commonFolder, '')
-            : `/${r.ref
-                .slice(
-                  r.ref.indexOf(
-                    splitPath(onBoardingState.indexFolder).pop() || '',
-                  ),
-                )
-                .slice(0, -r.name.length - 1)}`;
-        return {
-          ...r,
-          selected: true,
-          shortName: r.name,
-          folderName,
-        };
-      })
-      .sort((a, b) => (a.folderName > b.folderName ? 1 : -1));
+    return groupReposByParentFolder(localRepositories).sort((a, b) =>
+      a.folderName > b.folderName ? 1 : -1,
+    );
   }, [repositories]);
 
   const githubRepos = useMemo(() => {
@@ -97,16 +76,20 @@ const RepositoriesSettings = () => {
     setGitHubAuth(!githubRepos.length);
   }, [githubRepos.length]);
 
-  useEffect(() => {
-    getRepos().then((data) => {
-      setRepositories(data.list || []);
+  const fetchRepos = useCallback(() => {
+    return getRepos().then((data) => {
+      const list = data?.list?.sort((a, b) => (a.name < b.name ? -1 : 1)) || [];
+      setRepositories(list);
     });
+  }, []);
+
+  useEffect(() => {
+    fetchRepos();
   }, []);
 
   const handleRemoveOne = useCallback(async (repoRef: string) => {
     await deleteRepo(repoRef);
-    const data = await getRepos();
-    setRepositories(data.list || []);
+    await fetchRepos();
   }, []);
 
   const addReposMenuItems = useMemo(
@@ -158,15 +141,13 @@ const RepositoriesSettings = () => {
           />
         </div>
         <div className="flex flex-col gap-3.5">
-          {!isSelfServe && (
-            <GithubStatus
-              setGitHubAuth={setGitHubAuth}
-              setGitHubConnected={setGithubConnected}
-              githubAuth={githubAuth}
-              isConnected={isGithubConnected}
-              onLogout={onLogout}
-            />
-          )}
+          <GithubStatus
+            setGitHubAuth={setGitHubAuth}
+            setGitHubConnected={setGithubConnected}
+            githubAuth={githubAuth}
+            isConnected={isGithubConnected}
+            onLogout={onLogout}
+          />
         </div>
         <div className="mt-6 overflow-auto">
           <p className="text-gray-500 caption">Added repositories</p>

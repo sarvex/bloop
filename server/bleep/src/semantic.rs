@@ -178,18 +178,50 @@ impl Semantic {
             anyhow::bail!("no search target for query");
         };
 
-        let repo_filter = parsed_query
-            .repo()
-            .map(|r| make_kv_filter("repo_name", r).into());
+        let repo_filter = {
+            let conditions = parsed_query
+                .repos()
+                .map(|r| {
+                    if r.contains('/') && !r.starts_with("github.com/") {
+                        format!("github.com/{r}")
+                    } else {
+                        r.to_string()
+                    }
+                })
+                .map(|r| make_kv_filter("repo_name", r.as_str()).into())
+                .collect::<Vec<_>>();
+            // one of the above repos should match
+            if conditions.is_empty() {
+                None
+            } else {
+                Some(Filter {
+                    should: conditions,
+                    ..Default::default()
+                })
+            }
+        };
 
-        let lang_filter = parsed_query
-            .lang()
-            .map(|l| make_kv_filter("lang", l).into());
+        let lang_filter = {
+            let conditions = parsed_query
+                .langs()
+                .map(|l| make_kv_filter("lang", l).into())
+                .collect::<Vec<_>>();
+            // one of the above langs should match
+            if conditions.is_empty() {
+                None
+            } else {
+                Some(Filter {
+                    should: conditions,
+                    ..Default::default()
+                })
+            }
+        };
 
         let filters = [repo_filter, lang_filter]
             .into_iter()
             .flatten()
-            .collect::<Vec<_>>();
+            .map(Into::into)
+            .collect();
 
         let response = self
             .qdrant
