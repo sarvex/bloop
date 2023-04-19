@@ -35,11 +35,12 @@ use {
 };
 
 use super::{
-    reader::{ContentDocument, ContentReader},
+    reader::{ContentDocument, ContentReader, FileDocument, FileReader},
     DocumentRead, Indexable, Indexer,
 };
 use crate::{
     intelligence::TreeSitterFile,
+    query::{compiler::Compiler, parser::Query},
     repo::{FileCache, RepoMetadata, RepoRef, Repository},
     semantic::Semantic,
     symbol::SymbolLocations,
@@ -386,6 +387,49 @@ impl Indexer<File> {
         }
     }
 
+    /// Search this index for paths partially matching a given string.
+    ///
+    /// For example, the string `Cargo` can return documents whose path is `foo/Cargo.toml`,
+    /// or `bar/Cargo.lock`.
+    pub async fn partial_path_match(
+        &self,
+        repo_ref: &RepoRef,
+        relative_path: &str,
+    ) -> impl Iterator<Item = FileDocument> + '_ {
+        let reader = self.reader.read().await;
+        let searcher = reader.searcher();
+
+        let file_index = searcher.index();
+        let file_source = &self.source;
+
+        let mut compiler = Compiler::new().literal(self.source.repo_ref, |q| q.repo.clone());
+
+        if !relative_path.is_empty() {
+            compiler = compiler.literal(self.source.relative_path, |q| q.path.clone());
+        }
+
+        let query = Query {
+            path: Some(crate::query::parser::Literal::Plain(relative_path.into())),
+            repo: Some(crate::query::parser::Literal::Plain(
+                repo_ref.to_string().into(),
+            )),
+            ..Default::default()
+        };
+
+        let query = compiler.compile([&query].into_iter(), file_index).unwrap();
+        let collector = TopDocs::with_limit(1000);
+        searcher
+            .search(&query, &collector)
+            .expect("failed to search index")
+            .into_iter()
+            .map(move |(_, doc_addr)| {
+                let retrieved_doc = searcher
+                    .doc(doc_addr)
+                    .expect("failed to get document by address");
+                FileReader.read_document(file_source, retrieved_doc)
+            })
+    }
+
     pub async fn by_path(
         &self,
         repo_ref: &RepoRef,
@@ -562,17 +606,10 @@ impl File {
             match scope_graph {
                 // we have a graph, use that
                 Ok(graph) => SymbolLocations::TreeSitter(graph),
-                // no graph, try ctags instead
+                // no graph, it's empty
                 Err(err) => {
                     warn!(?err, %lang_str, "failed to build scope graph");
-                    match repo_metadata.symbols.get(relative_path) {
-                        Some(syms) => SymbolLocations::Ctags(syms.clone()),
-                        // no ctags either
-                        _ => {
-                            warn!(%lang_str, ?entry_disk_path, "failed to build tags");
-                            SymbolLocations::Empty
-                        }
-                    }
+                    SymbolLocations::Empty
                 }
             }
         } else {

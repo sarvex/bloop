@@ -22,6 +22,7 @@ use console_subscriber as _;
 #[cfg(target_os = "windows")]
 use dunce::canonicalize;
 use scc::hash_map::Entry;
+use secrecy::SecretString;
 use state::PersistedState;
 #[cfg(not(target_os = "windows"))]
 use std::fs::canonicalize;
@@ -29,7 +30,7 @@ use std::fs::canonicalize;
 use crate::{
     background::BackgroundExecutor, indexes::Indexes, semantic::Semantic, state::RepositoryPool,
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use axum::extract::FromRef;
 
 use once_cell::sync::OnceCell;
@@ -49,7 +50,6 @@ mod repo;
 mod webserver;
 
 pub mod analytics;
-pub mod ctags;
 pub mod indexes;
 pub mod intelligence;
 pub mod query;
@@ -124,13 +124,6 @@ impl Application {
         config.source.set_default_dir(&config.index_dir);
 
         let config = Arc::new(config);
-
-        // Set path to Ctags binary
-        if let Some(ref executable) = config.ctags_path {
-            ctags::CTAGS_BINARY
-                .set(executable.clone())
-                .map_err(|existing| anyhow!("ctags binary already set: {existing:?}"))?;
-        }
 
         // Initialise Semantic index if `qdrant_url` set in config
         let semantic = match config.qdrant_url {
@@ -325,6 +318,35 @@ impl Application {
     /// clear the conversation history for a user
     pub fn purge_prior_conversation(&self, user_id: &str) {
         self.prior_conversational_store.remove(user_id);
+    }
+
+    pub fn github_token(&self) -> Result<Option<SecretString>> {
+        Ok(if self.env.allow(env::Feature::GithubDeviceFlow) {
+            let Some(cred) = self.credentials.github() else {
+                bail!("missing Github token");
+            };
+
+            use remotes::github::{Auth, State};
+            match cred {
+                State {
+                    auth:
+                        Auth::OAuth {
+                            access_token: token,
+                            ..
+                        },
+                    ..
+                } => Some(token),
+
+                State {
+                    auth: Auth::App { .. },
+                    ..
+                } => {
+                    bail!("cannot connect to answer API using installation token");
+                }
+            }
+        } else {
+            None
+        })
     }
 }
 
