@@ -191,6 +191,12 @@ impl Conversation {
     ) -> Result<Option<ActionStream>> {
         let (action, raw_response) = action_stream.load(&mut update).await.unwrap();
 
+        if !matches!(action, Action::Query(..)) {
+            self.history
+                .push(llm_gateway::api::Message::assistant(&raw_response));
+            trace!("handling raw action: {raw_response}");
+        }
+
         let question = match action {
             Action::Query(s) => parser::parse_nl(&s)?
                 .target
@@ -714,9 +720,10 @@ impl SearchResult {
         let tag = v.first()?;
 
         match tag.as_str()? {
-            "cite" => Some(Self::Cite(CiteResult::from_json_array(&v[1..]))),
-            "con" => Some(Self::Conclude(ConcludeResult::from_json_array(&v[1..]))),
-            "new" => Some(Self::New(NewResult::from_json_array(&v[1..]))),
+            "cite" => CiteResult::from_json_array(&v[1..]).map(Self::Cite),
+            "new" => NewResult::from_json_array(&v[1..]).map(Self::New),
+            "mod" => ModifyResult::from_json_array(&v[1..]).map(Self::Modify),
+            "con" => ConcludeResult::from_json_array(&v[1..]).map(Self::Conclude),
             _ => None,
         }
     }
@@ -735,6 +742,7 @@ impl SearchResult {
     fn substitute_path_alias(self, path_aliases: &[String]) -> Self {
         match self {
             Self::Cite(cite) => Self::Cite(cite.substitute_path_alias(path_aliases)),
+            Self::Modify(mod_) => Self::Modify(mod_.substitute_path_alias(path_aliases)),
             s => s,
         }
     }
@@ -742,6 +750,7 @@ impl SearchResult {
 
 #[derive(serde::Serialize, Default, Debug, Clone)]
 struct CiteResult {
+    #[serde(skip)]
     path_alias: Option<u64>,
     path: Option<String>,
     comment: Option<String>,
@@ -756,7 +765,48 @@ struct NewResult {
 }
 
 #[derive(serde::Serialize, Default, Debug, Clone)]
-struct ModifyResult {}
+struct ModifyResult {
+    #[serde(skip)]
+    path_alias: Option<u64>,
+    path: Option<String>,
+    diff: Option<ModifyResultDiff>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
+struct ModifyResultDiff {
+    #[serde(rename(deserialize = "oldFileName"), default)]
+    old_file_name: String,
+
+    #[serde(rename(deserialize = "newFileName"), default)]
+    new_file_name: String,
+
+    #[serde(rename(deserialize = "oldHeader"), default)]
+    old_header: String,
+
+    #[serde(rename(deserialize = "newHeader"), default)]
+    new_header: String,
+
+    #[serde(default)]
+    hunks: Vec<ModifyResultHunk>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
+struct ModifyResultHunk {
+    #[serde(rename(deserialize = "oldStart"), default)]
+    old_start: usize,
+
+    #[serde(rename(deserialize = "newStart"), default)]
+    new_start: usize,
+
+    #[serde(rename(deserialize = "oldLines"), default)]
+    old_lines: usize,
+
+    #[serde(rename(deserialize = "newLines"), default)]
+    new_lines: usize,
+
+    #[serde(default)]
+    lines: Vec<String>,
+}
 
 #[derive(serde::Serialize, Default, Debug, Clone)]
 struct ConcludeResult {
@@ -764,7 +814,7 @@ struct ConcludeResult {
 }
 
 impl CiteResult {
-    fn from_json_array(v: &[serde_json::Value]) -> Self {
+    fn from_json_array(v: &[serde_json::Value]) -> Option<Self> {
         let path_alias = v.get(0).and_then(serde_json::Value::as_u64);
         let comment = v
             .get(1)
@@ -772,13 +822,14 @@ impl CiteResult {
             .map(ToOwned::to_owned);
         let start_line = v.get(2).and_then(serde_json::Value::as_u64);
         let end_line = v.get(3).and_then(serde_json::Value::as_u64);
-        Self {
+
+        Some(Self {
             path_alias,
             comment,
             start_line,
             end_line,
             ..Default::default()
-        }
+        })
     }
 
     fn substitute_path_alias(mut self, path_aliases: &[String]) -> Self {
@@ -792,7 +843,7 @@ impl CiteResult {
 }
 
 impl NewResult {
-    fn from_json_array(v: &[serde_json::Value]) -> Self {
+    fn from_json_array(v: &[serde_json::Value]) -> Option<Self> {
         let language = v
             .get(0)
             .and_then(serde_json::Value::as_str)
@@ -801,17 +852,47 @@ impl NewResult {
             .get(1)
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
-        Self { language, code }
+        Some(Self { language, code })
+    }
+}
+
+impl ModifyResult {
+    fn from_json_array(v: &[serde_json::Value]) -> Option<Self> {
+        let path_alias = v.get(0).and_then(serde_json::Value::as_u64);
+
+        // if we fail to deserialize the hunk, do not return a partially
+        // complete ModifyResult, just omit it altogether
+        let hunk_object = v
+            .get(1)
+            .cloned()
+            .map(serde_json::from_value::<ModifyResultDiff>)
+            .map(Result::ok)
+            .flatten()?;
+
+        Some(Self {
+            path_alias,
+            diff: Some(hunk_object),
+            ..Default::default()
+        })
+    }
+
+    fn substitute_path_alias(mut self, path_aliases: &[String]) -> Self {
+        self.path = self
+            .path_alias
+            .as_ref()
+            .and_then(|alias| path_aliases.get(*alias as usize))
+            .map(ToOwned::to_owned);
+        self
     }
 }
 
 impl ConcludeResult {
-    fn from_json_array(v: &[serde_json::Value]) -> Self {
+    fn from_json_array(v: &[serde_json::Value]) -> Option<Self> {
         let comment = v
             .get(0)
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
-        Self { comment }
+        Some(Self { comment })
     }
 }
 
