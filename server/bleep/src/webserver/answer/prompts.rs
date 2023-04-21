@@ -100,7 +100,7 @@ Do not use this to demonstrate updating an existing file.
 This is the best way to demonstrate updating an existing file.
 Changes should be as small as possible.
 
-["mod",INT: §ALIAS,STRING: GIT DIFF]
+["mod",INT: §ALIAS,STRING: LANGUAGE,STRING: GIT DIFF]
 Where GIT DIFF describes the diff chunks for the file, including the git diff header.
 For example:
 @@ -1 +1 @@

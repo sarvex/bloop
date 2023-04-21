@@ -783,6 +783,7 @@ struct ModifyResult {
     #[serde(skip)]
     path_alias: Option<u64>,
     path: Option<String>,
+    language: Option<String>,
     diff: Option<ModifyResultHunk>,
 }
 
@@ -908,8 +909,12 @@ impl NewResult {
 impl ModifyResult {
     fn from_json_array(v: &[serde_json::Value]) -> Option<Self> {
         let path_alias = v.get(0).and_then(serde_json::Value::as_u64);
-        let diff = v
+        let language = v
             .get(1)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let diff = v
+            .get(2)
             .and_then(serde_json::Value::as_str)
             .map(|raw_hunk| {
                 let header = raw_hunk.lines().next().and_then(|s| s.parse().ok());
@@ -923,6 +928,7 @@ impl ModifyResult {
 
         Some(Self {
             path_alias,
+            language,
             diff,
             ..Default::default()
         })
