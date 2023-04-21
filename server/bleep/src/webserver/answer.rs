@@ -783,43 +783,78 @@ struct ModifyResult {
     #[serde(skip)]
     path_alias: Option<u64>,
     path: Option<String>,
-    diff: Option<ModifyResultDiff>,
+    diff: Option<ModifyResultHunk>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
-struct ModifyResultDiff {
-    #[serde(rename(deserialize = "oldFileName"), default)]
-    old_file_name: Option<String>,
-
-    #[serde(rename(deserialize = "newFileName"), default)]
-    new_file_name: Option<String>,
-
-    #[serde(rename(deserialize = "oldHeader"), default)]
-    old_header: Option<String>,
-
-    #[serde(rename(deserialize = "newHeader"), default)]
-    new_header: Option<String>,
-
-    #[serde(default)]
-    hunks: Vec<ModifyResultHunk>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
+#[derive(serde::Serialize, Default, Debug, Clone)]
 struct ModifyResultHunk {
-    #[serde(rename(deserialize = "oldStart"), default)]
-    old_start: Option<usize>,
-
-    #[serde(rename(deserialize = "newStart"), default)]
-    new_start: Option<usize>,
-
-    #[serde(rename(deserialize = "oldLines"), default)]
-    old_lines: Option<usize>,
-
-    #[serde(rename(deserialize = "newLines"), default)]
-    new_lines: Option<usize>,
-
-    #[serde(default)]
+    header: Option<ModifyResultHunkHeader>,
     lines: Vec<String>,
+}
+
+#[derive(serde::Serialize, Default, Debug, Clone)]
+struct ModifyResultHunkHeader {
+    old_start: Option<usize>,
+    old_lines: Option<usize>,
+    new_start: Option<usize>,
+    new_lines: Option<usize>,
+}
+
+impl std::str::FromStr for ModifyResultHunkHeader {
+    type Err = ();
+
+    // a header looks like
+    //
+    //     @@ -98,20 +98,12 @@
+    //
+    // we want:
+    //
+    //     old_start: 98
+    //     old_lines: 20
+    //     new_start: 98
+    //     old_lines: 12
+    //
+    // this conversion method permits partially complete headers
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+
+        if !s.starts_with("@@") {
+            return Err(());
+        }
+
+        let s = &s[2..s.len()].trim();
+        let parts: Vec<&str> = s.split_whitespace().collect();
+
+        // we need atleast one part
+        if parts.is_empty() {
+            return Err(());
+        }
+
+        let parse_part = |part: &str| -> (Option<usize>, Option<usize>) {
+            let mut numbers = part.split(',');
+            let start = numbers.next().and_then(|s| s.parse::<usize>().ok());
+            let lines = numbers.next().and_then(|s| s.parse::<usize>().ok());
+            (start, lines)
+        };
+
+        let (old_start, old_lines) = parts
+            .get(0)
+            .map(|s| s.trim_start_matches('-'))
+            .map(parse_part)
+            .unwrap_or_default();
+        let (new_start, new_lines) = parts
+            .get(1)
+            .map(|s| s.trim_start_matches('+'))
+            .map(parse_part)
+            .unwrap_or_default();
+
+        Ok(Self {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+        })
+    }
 }
 
 #[derive(serde::Serialize, Default, Debug, Clone)]
@@ -873,19 +908,22 @@ impl NewResult {
 impl ModifyResult {
     fn from_json_array(v: &[serde_json::Value]) -> Option<Self> {
         let path_alias = v.get(0).and_then(serde_json::Value::as_u64);
-
-        // if we fail to deserialize the hunk, do not return a partially
-        // complete ModifyResult, just omit it altogether
-        let hunk_object = v
+        let diff = v
             .get(1)
-            .cloned()
-            .map(serde_json::from_value::<ModifyResultDiff>)
-            .map(Result::ok)
-            .flatten()?;
+            .and_then(serde_json::Value::as_str)
+            .map(|raw_hunk| {
+                let header = raw_hunk.lines().next().and_then(|s| s.parse().ok());
+                let lines = raw_hunk
+                    .lines()
+                    .skip(1)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                ModifyResultHunk { header, lines }
+            });
 
         Some(Self {
             path_alias,
-            diff: Some(hunk_object),
+            diff,
             ..Default::default()
         })
     }
@@ -894,7 +932,17 @@ impl ModifyResult {
         self.path = self
             .path_alias
             .as_ref()
-            .and_then(|alias| path_aliases.get(*alias as usize))
+            .and_then(|alias| {
+                if let Some(p) = path_aliases.get(*alias as usize) {
+                    Some(p)
+                } else {
+                    tracing::warn!("no path found for alias `{alias}`");
+                    for (idx, p) in path_aliases.iter().enumerate() {
+                        tracing::warn!("we have {idx}. {p}");
+                    }
+                    None
+                }
+            })
             .map(ToOwned::to_owned);
         self
     }
