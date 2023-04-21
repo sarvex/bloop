@@ -82,6 +82,7 @@ pub(super) async fn handle(
     let q = params.q;
     let stream = async_stream::try_stream! {
         let mut action_stream = Action::Query(q).into()?;
+        let mut full_update = FullUpdate::new(&conversation_id, &conversation);
 
         loop {
             // The main loop. Here, we create two streams that operate simultaneously; the update
@@ -97,17 +98,18 @@ pub(super) async fn handle(
             let left_stream = tokio_stream::wrappers::ReceiverStream::new(update_rx)
                 .map(Either::Left);
 
-            let mut update_stream = UpdateStream::new(&conversation_id, &conversation);
-            update_stream.set_tx(update_tx);
             let right_stream = conversation
-                .step(&ctx, action_stream, update_stream)
+                .step(&ctx, action_stream, update_tx)
                 .into_stream()
                 .map(Either::Right);
 
             let mut next = None;
             for await item in stream::select(left_stream, right_stream) {
                 match item {
-                    Either::Left(upd) => yield upd,
+                    Either::Left(upd) => {
+                        full_update.apply_update(upd);
+                        yield full_update.clone()
+                    },
                     Either::Right(n) => next = n?,
                 }
             }
@@ -117,6 +119,15 @@ pub(super) async fn handle(
                 None => break,
             }
         }
+
+        // TODO: add `conclusion` of last assistant response to history
+        //       currently, history is not user-facing history.
+        //
+        // conversation
+        //     .history
+        //     .push(llm_gateway::api::Message::assistant(
+        //         full_update.conclusion().unwrap_or_default(),
+        //     ));
 
         // Storing the conversation here allows us to make subsequent requests.
         state.conversations
@@ -176,7 +187,7 @@ impl Conversation {
         &mut self,
         ctx: &AppContext,
         action_stream: ActionStream,
-        mut update: UpdateStream,
+        mut update: Sender<Update>,
     ) -> Result<Option<ActionStream>> {
         let (action, raw_response) = action_stream.load(&mut update).await.unwrap();
 
@@ -194,7 +205,13 @@ impl Conversation {
             }
 
             Action::Answer(rephrased_question) => {
-                self.answer(ctx, update, &rephrased_question).await?;
+                self.answer(
+                    ctx,
+                    update,
+                    &rephrased_question,
+                    self.path_aliases.as_slice(),
+                )
+                .await?;
                 let r: Result<ActionStream> = Action::Prompt(prompts::CONTINUE.to_owned()).into();
                 return Ok(Some(r?));
             }
@@ -412,8 +429,9 @@ impl Conversation {
     async fn answer(
         &self,
         ctx: &AppContext,
-        mut update: UpdateStream,
+        update: Sender<Update>,
         question: &str,
+        path_aliases: &[String],
     ) -> Result<()> {
         let messages = self
             .history
@@ -441,14 +459,11 @@ impl Conversation {
                 .iter()
                 .map(Vec::as_slice)
                 .filter_map(SearchResult::from_json_array)
+                .map(|s| s.substitute_path_alias(path_aliases))
                 .collect::<Vec<_>>();
 
-            update.set_results(search_results);
-
-            update.send().await?;
+            update.send(Update::Result(search_results)).await?;
         }
-
-        update.clear_current_message();
 
         Ok(())
     }
@@ -558,93 +573,73 @@ impl Action {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug)]
 enum Update {
-    Prompt(String),
-    Answer(String),
-    ProcessingQuery,
-    SearchingFiles,
-    Answering,
-    LoadingFiles,
+    Step(SearchStep),
+    Result(Vec<SearchResult>),
 }
 
-struct UpdateStream {
-    sender: Option<Sender<FullUpdate>>,
-
-    // past messages of this conversation
-    history: Vec<llm_gateway::api::Message>,
-
-    // the message currently being produced
-    current_message: AssistantMessage,
-
-    // auxilliary data that has no other place to go
+#[derive(serde::Serialize, Debug, Clone, Default)]
+struct FullUpdate {
     thread_id: String,
     user_id: String,
+    description: Option<String>,
+
+    // TODO: tooling-state-update/@np should contain history of chats between user and
+    // assistant only, omitting system prompts or intermediate assistant steps.
+    messages: Vec<UpdatableMessage>,
 }
 
-impl UpdateStream {
-    // initialize the update stream, given an existing conversation history
+impl FullUpdate {
     fn new(conversation_id: &ConversationId, conversation: &Conversation) -> Self {
-        let history = conversation.history.clone();
-        let current_message = AssistantMessage::default();
         let thread_id = conversation_id.thread_id.clone();
         let user_id = conversation_id.user_id.clone();
-
+        let description = Some(format!(
+            "New conversation in {}",
+            conversation.repo_ref.display_name()
+        ));
+        let messages = vec![UpdatableMessage::Assistant(AssistantMessage::default())];
         Self {
-            sender: None,
-            history,
-            current_message,
             thread_id,
             user_id,
-        }
-    }
-
-    fn set_tx(&mut self, sender: Sender<FullUpdate>) {
-        self.sender = Some(sender);
-    }
-
-    fn build_update(&self) -> FullUpdate {
-        let messages = self
-            .history
-            .iter()
-            .filter_map(|llm_message| match llm_message.role.as_str() {
-                "user" => Some(UpdatableMessage::User(UserMessage {
-                    content: llm_message.content.clone(),
-                })),
-                "assistant" => Some(UpdatableMessage::Assistant(AssistantMessage {
-                    content: Some(llm_message.content.clone()),
-                    status: MessageStatus::Finished,
-                    ..Default::default()
-                })),
-                _ => None,
-            })
-            .chain(std::iter::once(UpdatableMessage::Assistant(
-                self.current_message.clone(),
-            )))
-            .collect::<Vec<_>>();
-
-        FullUpdate {
-            thread_id: self.thread_id.clone(),
-            user_id: self.user_id.clone(),
-            description: Some("New conversation".into()), // TODO: fill this out cleverly
+            description,
             messages,
         }
     }
 
-    fn finish_message(&mut self) {
-        self.current_message.status = MessageStatus::Finished;
+    fn current_message(&self) -> &AssistantMessage {
+        match self.messages.last().unwrap() {
+            UpdatableMessage::User(_) => {
+                panic!("called `current_message` when last message was a `user` message")
+            }
+            UpdatableMessage::Assistant(a) => a,
+        }
     }
 
-    fn clear_current_message(&mut self) {
-        self.current_message = AssistantMessage::default();
+    fn current_message_mut(&mut self) -> &mut AssistantMessage {
+        match self.messages.last_mut().unwrap() {
+            UpdatableMessage::User(_) => {
+                panic!("called `current_message_mut` when last message was a `user` message")
+            }
+            UpdatableMessage::Assistant(a) => a,
+        }
+    }
+
+    fn apply_update(&mut self, update: Update) {
+        match update {
+            Update::Step(search_step) => self.add_search_step(search_step),
+            Update::Result(search_results) => self.set_results(search_results),
+        }
     }
 
     fn add_search_step(&mut self, step: SearchStep) {
-        self.current_message.search_steps.push(step);
+        self.current_message_mut().search_steps.push(step);
     }
 
-    // - populates message.results
-    // - if a conclusion exists, sets message.content to the conclusion
+    fn finish_message(&mut self) {
+        self.current_message_mut().status = MessageStatus::Finished;
+    }
+
     fn set_results(&mut self, mut results: Vec<SearchResult>) {
         let conclusion = results
             .iter()
@@ -654,27 +649,13 @@ impl UpdateStream {
                 results.remove(idx).conclusion()
             });
 
-        self.current_message.results = results;
-        self.current_message.content = conclusion;
+        self.current_message_mut().results = results;
+        self.current_message_mut().content = conclusion;
     }
 
-    async fn send(&self) -> Result<()> {
-        if let Some(s) = &self.sender {
-            s.send(self.build_update())
-                .await
-                .or(Err(anyhow!("failed to send update")))
-        } else {
-            Err(anyhow!("failed to send update"))
-        }
+    fn conclusion(&self) -> Option<&str> {
+        self.current_message().content.as_ref().map(String::as_str)
     }
-}
-
-#[derive(serde::Serialize, Debug, Clone, Default)]
-struct FullUpdate {
-    thread_id: String,
-    user_id: String,
-    description: Option<String>,
-    messages: Vec<UpdatableMessage>,
 }
 
 #[derive(serde::Serialize, Debug, Clone)]
@@ -750,26 +731,34 @@ impl SearchResult {
             _ => None,
         }
     }
+
+    fn substitute_path_alias(self, path_aliases: &[String]) -> Self {
+        match self {
+            Self::Cite(cite) => Self::Cite(cite.substitute_path_alias(path_aliases)),
+            s => s,
+        }
+    }
 }
 
-#[derive(serde::Serialize, Debug, Clone)]
+#[derive(serde::Serialize, Default, Debug, Clone)]
 struct CiteResult {
     path_alias: Option<u64>,
+    path: Option<String>,
     comment: Option<String>,
     start_line: Option<u64>,
     end_line: Option<u64>,
 }
 
-#[derive(serde::Serialize, Debug, Clone)]
+#[derive(serde::Serialize, Default, Debug, Clone)]
 struct NewResult {
     language: Option<String>,
     code: Option<String>,
 }
 
-#[derive(serde::Serialize, Debug, Clone)]
+#[derive(serde::Serialize, Default, Debug, Clone)]
 struct ModifyResult {}
 
-#[derive(serde::Serialize, Debug, Clone)]
+#[derive(serde::Serialize, Default, Debug, Clone)]
 struct ConcludeResult {
     comment: Option<String>,
 }
@@ -788,7 +777,17 @@ impl CiteResult {
             comment,
             start_line,
             end_line,
+            ..Default::default()
         }
+    }
+
+    fn substitute_path_alias(mut self, path_aliases: &[String]) -> Self {
+        self.path = self
+            .path_alias
+            .as_ref()
+            .and_then(|alias| path_aliases.get(*alias as usize))
+            .map(ToOwned::to_owned);
+        self
     }
 }
 
@@ -824,13 +823,12 @@ struct ActionStream {
 
 impl ActionStream {
     /// Load this action, consuming the stream if required.
-    async fn load(mut self, update: &mut UpdateStream) -> Result<(Action, String)> {
+    async fn load(mut self, update: &mut Sender<Update>) -> Result<(Action, String)> {
         let mut stream = match self.action {
             Either::Left(stream) => stream,
             Either::Right(action) => {
-                update.add_search_step(action.update());
                 update
-                    .send()
+                    .send(Update::Step(action.update()))
                     .await
                     .or(Err(anyhow!("failed to send update")))?;
                 return Ok((action, self.tokens));
@@ -842,9 +840,8 @@ impl ActionStream {
         }
 
         let action = Action::deserialize_gpt(&self.tokens)?;
-        update.add_search_step(action.update());
         update
-            .send()
+            .send(Update::Step(action.update()))
             .await
             .or(Err(anyhow!("failed to send update")))?;
 
