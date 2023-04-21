@@ -647,6 +647,9 @@ impl FullUpdate {
     }
 
     fn set_results(&mut self, mut results: Vec<SearchResult>) {
+        // fish out the conclusion from the result list, if any
+        //
+        // the conclusion is attached as message.content
         let conclusion = results
             .iter()
             .position(SearchResult::is_conclusion)
@@ -655,7 +658,18 @@ impl FullUpdate {
                 results.remove(idx).conclusion()
             });
 
-        self.current_message_mut().results = results;
+        // we always want the results to be additive, however
+        // some updates may result in fewer number of search results
+        //
+        // this can occur when the partially parsed json is not
+        // sufficient to produce a search result (as in the case of a ModifyResult)
+        //
+        // we only update the search results when the latest update
+        // gives us more than what we already have
+        if self.current_message().results.len() <= results.len() {
+            self.current_message_mut().results = results;
+        }
+
         self.current_message_mut().content = conclusion;
     }
 
@@ -775,16 +789,16 @@ struct ModifyResult {
 #[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
 struct ModifyResultDiff {
     #[serde(rename(deserialize = "oldFileName"), default)]
-    old_file_name: String,
+    old_file_name: Option<String>,
 
     #[serde(rename(deserialize = "newFileName"), default)]
-    new_file_name: String,
+    new_file_name: Option<String>,
 
     #[serde(rename(deserialize = "oldHeader"), default)]
-    old_header: String,
+    old_header: Option<String>,
 
     #[serde(rename(deserialize = "newHeader"), default)]
-    new_header: String,
+    new_header: Option<String>,
 
     #[serde(default)]
     hunks: Vec<ModifyResultHunk>,
@@ -793,16 +807,16 @@ struct ModifyResultDiff {
 #[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
 struct ModifyResultHunk {
     #[serde(rename(deserialize = "oldStart"), default)]
-    old_start: usize,
+    old_start: Option<usize>,
 
     #[serde(rename(deserialize = "newStart"), default)]
-    new_start: usize,
+    new_start: Option<usize>,
 
     #[serde(rename(deserialize = "oldLines"), default)]
-    old_lines: usize,
+    old_lines: Option<usize>,
 
     #[serde(rename(deserialize = "newLines"), default)]
-    new_lines: usize,
+    new_lines: Option<usize>,
 
     #[serde(default)]
     lines: Vec<String>,
